@@ -21,7 +21,7 @@ app = Flask(__name__)
 app.config.from_object(Config)
 
 # Simple CORS configuration that works with Flask-CORS 3.0.7
-CORS(app, 
+CORS(app,
      resources={r"/*": {
          "origins": "*",
          "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD"],
@@ -97,10 +97,10 @@ def not_found(error):
     from utils.request_context import get_request_context
     ctx = get_request_context()
     request_id = ctx.request_id if ctx and hasattr(ctx, 'request_id') else 'N/A'
-    
+
     # Support both JSON and HTML responses
     if request.headers.get('Accept', '').startswith('text/html'):
-        return render_template('error.html', 
+        return render_template('error.html',
                              error_code=404,
                              error_message='Page Not Found',
                              error_details='The requested resource could not be found.',
@@ -114,9 +114,9 @@ def internal_error(error):
     from utils.request_context import get_request_context
     ctx = get_request_context()
     request_id = ctx.request_id if ctx and hasattr(ctx, 'request_id') else 'N/A'
-    
+
     logger.error(f"[{request_id}] Internal error: {str(error)}")
-    
+
     # Support both JSON and HTML responses
     if request.headers.get('Accept', '').startswith('text/html'):
         return render_template('error.html',
@@ -125,3 +125,24 @@ def internal_error(error):
                              error_details='An unexpected error occurred. Please try again later.',
                              request_id=request_id), 500
     return jsonify({'error': 'Internal server error', 'request_id': request_id}), 500
+
+@app.route('/admin')
+def admin_dashboard():
+    """Admin dashboard"""
+    from utils.request_context import get_request_context
+    ctx = get_request_context()
+    request_id = ctx.request_id if ctx and hasattr(ctx, 'request_id') else 'N/A'
+
+    # Get data
+    users = User.query.all()
+    projects = Project.query.all()
+    tasks = Task.query.all()
+
+    return render_template('admin.html',
+                         users=users,
+                         projects=projects,
+                         tasks=tasks,
+                         request_id=request_id)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
