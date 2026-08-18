@@ -2,6 +2,7 @@
 from jinja2 import contextfilter
 from datetime import datetime
 import hashlib
+import html
 
 @contextfilter
 def format_datetime(context, value, format='%Y-%m-%d %H:%M:%S'):
@@ -67,5 +68,7 @@ def role_badge(context, role):
         'team_member': 'secondary'
     }
     color = role_colors.get(role, 'secondary')
-    return f'<span class="badge badge-{color}">{role}</span>'
+    # HTML-encode the role value to prevent Stored XSS when the template uses |safe
+    safe_role = html.escape(str(role) if role is not None else '')
+    return f'<span class="badge badge-{color}">{safe_role}</span>'
 
