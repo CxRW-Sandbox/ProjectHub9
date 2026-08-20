@@ -249,6 +249,166 @@ class TestProcessPickleFileSecurity(unittest.TestCase):
         )
 
 
+class TestRoleBadgeXSSPrevention(unittest.TestCase):
+    """
+    Security regression tests for CWE-79 (Stored XSS) in the role_badge Jinja2 filter.
+
+    The original role_badge() embedded the role value directly into an HTML
+    string without escaping, then the template rendered it with |safe, allowing
+    stored XSS via a malicious role value in the database.
+
+    The remediation uses html.escape() so that special HTML characters in the
+    role value are neutralised before they reach the browser.
+
+    These tests verify:
+      1. Normal role values produce correct badge markup (functionality preserved).
+      2. XSS payloads are escaped and cannot execute as HTML/JS.
+      3. The html.escape() call is present in the source (static regression guard).
+      4. The badge CSS class is derived from the allowlist, not the tainted input.
+    """
+
+    def setUp(self):
+        """Import role_badge with a fake Jinja2 context (contextfilter needs it)."""
+        # Provide a minimal mapping that satisfies @contextfilter expectations.
+        # contextfilter passes the context as the first argument; a plain dict works.
+        self.ctx = {}
+
+    def _call_role_badge(self, role):
+        """Helper: call the filter the same way Jinja2 does (ctx, value)."""
+        from utils.jinja_filters import role_badge
+        return role_badge(self.ctx, role)
+
+    # ------------------------------------------------------------------
+    # Positive / functionality tests
+    # ------------------------------------------------------------------
+
+    def test_admin_role_produces_danger_badge(self):
+        """role_badge('admin') should produce a badge with the danger class."""
+        result = self._call_role_badge('admin')
+        self.assertIn('badge-danger', result)
+        self.assertIn('admin', result)
+
+    def test_project_manager_role_produces_primary_badge(self):
+        """role_badge('project_manager') should produce a badge with the primary class."""
+        result = self._call_role_badge('project_manager')
+        self.assertIn('badge-primary', result)
+        self.assertIn('project_manager', result)
+
+    def test_team_member_role_produces_secondary_badge(self):
+        """role_badge('team_member') should produce a badge with the secondary class."""
+        result = self._call_role_badge('team_member')
+        self.assertIn('badge-secondary', result)
+        self.assertIn('team_member', result)
+
+    def test_unknown_role_produces_secondary_badge(self):
+        """An unknown (but benign) role falls back to the secondary class."""
+        result = self._call_role_badge('viewer')
+        self.assertIn('badge-secondary', result)
+        self.assertIn('viewer', result)
+
+    def test_output_is_a_span_element(self):
+        """role_badge should always produce a <span> element."""
+        result = self._call_role_badge('admin')
+        self.assertTrue(result.startswith('<span'))
+        self.assertTrue(result.endswith('</span>'))
+
+    # ------------------------------------------------------------------
+    # Security / XSS regression tests
+    # ------------------------------------------------------------------
+
+    def test_script_tag_xss_payload_is_escaped(self):
+        """
+        A role value containing a <script> tag must be HTML-escaped so the
+        browser renders it as text, not as executable JavaScript.
+
+        The unescaped payload '<script>alert(1)</script>' would trigger XSS.
+        After escaping it becomes '&lt;script&gt;alert(1)&lt;/script&gt;'.
+        """
+        xss_payload = '<script>alert(1)</script>'
+        result = self._call_role_badge(xss_payload)
+        # The raw payload must NOT appear in the output
+        self.assertNotIn('<script>', result)
+        self.assertNotIn('</script>', result)
+        # The escaped form must be present instead
+        self.assertIn('&lt;script&gt;', result)
+        self.assertIn('&lt;/script&gt;', result)
+
+    def test_event_handler_xss_payload_is_escaped(self):
+        """
+        A role value designed to break out of an attribute context and inject
+        an event handler (e.g. '"><img src=x onerror=alert(1)>') must be escaped.
+        """
+        xss_payload = '"><img src=x onerror=alert(1)>'
+        result = self._call_role_badge(xss_payload)
+        self.assertNotIn('<img', result)
+        self.assertNotIn('onerror', result)
+        # Double-quote in the payload must be escaped
+        self.assertIn('&quot;', result)
+
+    def test_angle_brackets_are_escaped(self):
+        """Angle brackets in a role value must be converted to HTML entities."""
+        result = self._call_role_badge('<malicious>')
+        self.assertNotIn('<malicious>', result)
+        self.assertIn('&lt;malicious&gt;', result)
+
+    def test_ampersand_is_escaped(self):
+        """Ampersands in a role value must be escaped to prevent entity injection."""
+        result = self._call_role_badge('a & b')
+        self.assertNotIn(' & ', result)
+        self.assertIn('&amp;', result)
+
+    def test_double_quote_is_escaped(self):
+        """Double-quotes in a role value are escaped (quote=True used in html.escape)."""
+        result = self._call_role_badge('role"name')
+        self.assertNotIn('"name', result)
+        self.assertIn('&quot;', result)
+
+    def test_xss_payload_does_not_affect_badge_class(self):
+        """
+        The CSS class on the <span> element is derived from the known allowlist
+        (admin/project_manager/team_member), never from the tainted role string.
+        An unrecognised XSS payload must fall back to 'secondary', not inject
+        attacker-controlled content into the class attribute.
+        """
+        xss_payload = 'admin"><script>alert(1)</script>'
+        result = self._call_role_badge(xss_payload)
+        # Class must be one of the safe allowlist values (falls back to secondary)
+        self.assertIn('badge-secondary', result)
+        # The script tag in the payload must be escaped
+        self.assertNotIn('<script>', result)
+
+    def test_none_role_does_not_raise(self):
+        """role_badge(None) must not raise an exception and must return safe HTML."""
+        result = self._call_role_badge(None)
+        self.assertIsInstance(result, str)
+        self.assertIn('<span', result)
+        self.assertNotIn('<script>', result)
+
+    def test_html_escape_is_used_in_source(self):
+        """
+        Confirm that role_badge uses html.escape() as the sanitizer.
+
+        This static-analysis-style test ensures the SAST-recognised API is
+        present in the source code so that the scanner can verify the fix.
+        """
+        import inspect
+        from utils import jinja_filters
+        source = inspect.getsource(jinja_filters.role_badge)
+        self.assertIn(
+            'html.escape',
+            source,
+            "role_badge must call html.escape() to sanitize the role value"
+        )
+
+    def test_html_module_imported(self):
+        """Confirm that the html standard-library module is imported in jinja_filters."""
+        import utils.jinja_filters as jf_module
+        self.assertTrue(
+            hasattr(jf_module, 'html'),
+            "The 'html' standard-library module must be imported in jinja_filters.py"
+        )
+
+
 if __name__ == '__main__':
     unittest.main()
 
