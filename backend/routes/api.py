@@ -9,7 +9,7 @@ from utils.logger import log_api_request, log_user_action
 from utils.request_context import get_request_context, get_request_metadata, request_id
 from utils.query_helpers import QueryHelper
 from utils.datetime_utils import get_utc_now
-from sqlalchemy import text
+from sqlalchemy import text, or_
 
 bp = Blueprint('api', __name__)
 
@@ -214,23 +214,20 @@ def get_tasks_api():
     search = request.args.get('search', '')
     project_id = request.args.get('project_id')
     assigned_to = request.args.get('assigned_to')
-    
+
+    # Use ORM filtering with parameterized queries to prevent SQL injection
+    query = Task.query
     if search:
-        query = "SELECT * FROM tasks WHERE title LIKE '%{}%' OR description LIKE '%{}%'".format(search, search)
-        if project_id:
-            query += f" AND project_id = {project_id}"
-        if assigned_to:
-            query += f" AND assigned_to = {assigned_to}"
-        result = db.session.execute(text(query))
-        tasks = [dict(row) for row in result]
-    else:
-        query = Task.query
-        if project_id:
-            query = query.filter_by(project_id=project_id)
-        if assigned_to:
-            query = query.filter_by(assigned_to=assigned_to)
-        tasks = query.all()
-    
+        search_pattern = f"%{search}%"
+        query = query.filter(
+            or_(Task.title.like(search_pattern), Task.description.like(search_pattern))
+        )
+    if project_id:
+        query = query.filter_by(project_id=project_id)
+    if assigned_to:
+        query = query.filter_by(assigned_to=assigned_to)
+    tasks = query.all()
+
     return jsonify({
         'tasks': [t.to_dict() for t in tasks]
     })
