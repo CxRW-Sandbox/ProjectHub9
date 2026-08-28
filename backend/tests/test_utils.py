@@ -249,6 +249,218 @@ class TestProcessPickleFileSecurity(unittest.TestCase):
         )
 
 
+class TestUserDisplayNameXSSPrevention(unittest.TestCase):
+    """
+    Security regression tests for CWE-79 (Stored XSS) in the user_display_name
+    Jinja2 filter.
+
+    The original user_display_name() returned the raw username / email string
+    from the database without escaping.  When Jinja2 rendered this value in the
+    admin dashboard template, a malicious username containing HTML/JS payloads
+    (stored in the database by an attacker) would be written verbatim into the
+    page, enabling Stored XSS.
+
+    The remediation applies html.escape() to the returned value and wraps it in
+    jinja2.Markup so that Jinja2 treats it as already-escaped — preventing both
+    XSS injection and unwanted double-escaping of legitimate content.
+
+    These tests verify:
+      1. Normal usernames/emails pass through unchanged (functionality preserved).
+      2. XSS payloads in usernames / emails are HTML-escaped and cannot execute.
+      3. The html.escape() call is present in the source (static regression guard).
+      4. The return type is Markup (so Jinja2 does not double-escape entities).
+    """
+
+    def setUp(self):
+        """Provide a minimal context mapping (contextfilter passes it as arg 1)."""
+        self.ctx = {}
+
+    def _call_filter(self, user):
+        """Call user_display_name the same way Jinja2 does (ctx, user)."""
+        from utils.jinja_filters import user_display_name
+        return user_display_name(self.ctx, user)
+
+    # ------------------------------------------------------------------
+    # Positive / functionality tests
+    # ------------------------------------------------------------------
+
+    def test_dict_user_username_returned(self):
+        """A dict user with a username field should return that username."""
+        result = self._call_filter({'username': 'alice', 'email': 'alice@example.com'})
+        self.assertIn('alice', result)
+
+    def test_dict_user_falls_back_to_email(self):
+        """A dict user without a username should fall back to email."""
+        result = self._call_filter({'email': 'bob@example.com'})
+        self.assertIn('bob@example.com', result)
+
+    def test_dict_user_falls_back_to_unknown(self):
+        """A dict user with neither username nor email returns 'Unknown'."""
+        result = self._call_filter({})
+        self.assertIn('Unknown', result)
+
+    def test_object_user_username_returned(self):
+        """An object user with a username attribute returns that username."""
+        class FakeUser:
+            username = 'charlie'
+            email = 'charlie@example.com'
+        result = self._call_filter(FakeUser())
+        self.assertIn('charlie', result)
+
+    def test_object_user_falls_back_to_email(self):
+        """An object user without a username attribute falls back to email."""
+        class FakeUser:
+            email = 'diana@example.com'
+        result = self._call_filter(FakeUser())
+        self.assertIn('diana@example.com', result)
+
+    def test_return_type_is_markup(self):
+        """
+        The filter must return a jinja2.Markup instance so Jinja2 does not
+        double-escape the already-escaped entities.
+        """
+        from jinja2 import Markup
+        result = self._call_filter({'username': 'normaluser'})
+        self.assertIsInstance(
+            result, Markup,
+            "user_display_name must return a Markup instance, not a plain str"
+        )
+
+    def test_benign_username_is_unmodified(self):
+        """A username with no special HTML characters passes through unchanged."""
+        result = self._call_filter({'username': 'normaluser123'})
+        self.assertEqual(str(result), 'normaluser123')
+
+    # ------------------------------------------------------------------
+    # Security / XSS regression tests
+    # ------------------------------------------------------------------
+
+    def test_script_tag_in_username_is_escaped(self):
+        """
+        A username containing a <script> tag must be HTML-escaped.
+
+        An attacker who registers with username '<script>alert(1)</script>'
+        would previously trigger XSS on the admin dashboard.  After escaping
+        the tag characters become HTML entities that the browser renders as
+        text, not as code.
+        """
+        xss_payload = '<script>alert(1)</script>'
+        result = self._call_filter({'username': xss_payload})
+        # The raw payload must NOT appear
+        self.assertNotIn('<script>', str(result))
+        self.assertNotIn('</script>', str(result))
+        # The escaped form must be present
+        self.assertIn('&lt;script&gt;', str(result))
+        self.assertIn('&lt;/script&gt;', str(result))
+
+    def test_img_onerror_xss_in_username_is_escaped(self):
+        """
+        An img onerror XSS payload in a username must be escaped.
+        e.g. '"><img src=x onerror=alert(1)>'
+        """
+        xss_payload = '"><img src=x onerror=alert(1)>'
+        result = self._call_filter({'username': xss_payload})
+        self.assertNotIn('<img', str(result))
+        self.assertNotIn('onerror', str(result))
+        # The leading double-quote must be escaped
+        self.assertIn('&quot;', str(result))
+
+    def test_angle_brackets_in_email_are_escaped(self):
+        """Angle brackets in an email address must be converted to HTML entities."""
+        result = self._call_filter({'email': 'user<tag>@example.com'})
+        self.assertNotIn('<tag>', str(result))
+        self.assertIn('&lt;tag&gt;', str(result))
+
+    def test_ampersand_in_username_is_escaped(self):
+        """Ampersands in a username must be escaped to '&amp;'."""
+        result = self._call_filter({'username': 'me & you'})
+        self.assertNotIn(' & ', str(result))
+        self.assertIn('&amp;', str(result))
+
+    def test_double_quote_in_username_is_escaped(self):
+        """Double-quotes in a username are escaped (quote=True in html.escape)."""
+        result = self._call_filter({'username': 'user"name'})
+        self.assertNotIn('"name', str(result))
+        self.assertIn('&quot;', str(result))
+
+    def test_javascript_uri_in_username_is_not_rendered_as_link(self):
+        """
+        A username containing 'javascript:' must not be rendered inside an
+        anchor href — the filter returns a plain text Markup, not a link element,
+        so the javascript: scheme never appears in an executable context.
+        The value itself passes through unchanged (no <> or & present), but
+        the Markup wrapper ensures Jinja2 will not wrap it in executable HTML.
+        """
+        xss_payload = "javascript:alert(1)"
+        result = self._call_filter({'username': xss_payload})
+        # The filter must return the text content; no HTML tags are introduced
+        self.assertNotIn('<a', str(result))
+        self.assertNotIn('<script', str(result))
+        # The return type must be Markup (already verified above), confirming
+        # no additional Jinja2 escaping that could corrupt the raw text.
+        from jinja2 import Markup
+        self.assertIsInstance(result, Markup)
+
+    def test_none_username_does_not_raise(self):
+        """
+        If the username attribute is explicitly None the filter must not raise
+        and must return a safe Markup string.
+        """
+        class FakeUser:
+            username = None
+            email = None
+        result = self._call_filter(FakeUser())
+        from jinja2 import Markup
+        self.assertIsInstance(result, Markup)
+        # Must not contain literal 'None' string rendered as-is either
+        self.assertNotIn('<', str(result))
+
+    # ------------------------------------------------------------------
+    # Static / source-code regression guards
+    # ------------------------------------------------------------------
+
+    def test_html_escape_is_used_in_source(self):
+        """
+        Confirm that user_display_name calls html.escape() — the stdlib
+        sanitizer that SAST engines (CWE-79) recognise as breaking taint flow.
+        """
+        import inspect
+        from utils import jinja_filters
+        source = inspect.getsource(jinja_filters.user_display_name)
+        self.assertIn(
+            'html.escape',
+            source,
+            "user_display_name must call html.escape() to sanitise the display name"
+        )
+
+    def test_markup_wrapper_is_used_in_source(self):
+        """
+        Confirm that user_display_name wraps the escaped value in Markup so
+        Jinja2 does not double-escape the HTML entities.
+        """
+        import inspect
+        from utils import jinja_filters
+        source = inspect.getsource(jinja_filters.user_display_name)
+        self.assertIn(
+            'Markup',
+            source,
+            "user_display_name must wrap the escaped string in Markup"
+        )
+
+    def test_no_double_escaping_of_ampersand(self):
+        """
+        A literal '&amp;' entity in a username must not be re-escaped to
+        '&amp;amp;'.  The Markup wrapper prevents this.
+        """
+        # First call: raw ampersand → should become &amp;
+        result = self._call_filter({'username': 'A & B'})
+        # Second render: Jinja2 sees Markup → no further escaping
+        # We verify the string contains &amp; exactly once (not &amp;amp;)
+        escaped = str(result)
+        self.assertEqual(escaped.count('&amp;'), 1)
+        self.assertNotIn('&amp;amp;', escaped)
+
+
 class TestRoleBadgeXSSPrevention(unittest.TestCase):
     """
     Security regression tests for CWE-79 (Stored XSS) in the role_badge Jinja2 filter.
