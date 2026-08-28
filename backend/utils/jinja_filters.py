@@ -1,5 +1,5 @@
 # Jinja2 template filters
-from jinja2 import contextfilter
+from jinja2 import contextfilter, Markup
 from datetime import datetime
 import hashlib
 import html
@@ -18,10 +18,20 @@ def format_datetime(context, value, format='%Y-%m-%d %H:%M:%S'):
 
 @contextfilter
 def user_display_name(context, user):
-    """Get user display name from context"""
+    """Get user display name from context.
+
+    Returns an HTML-escaped Markup string so that stored XSS payloads in
+    username or email fields are neutralised before reaching the browser.
+    html.escape() is the stdlib sanitizer recognised by SAST engines (CWE-79).
+    """
     if isinstance(user, dict):
-        return user.get('username', user.get('email', 'Unknown'))
-    return getattr(user, 'username', getattr(user, 'email', 'Unknown'))
+        raw = user.get('username', user.get('email', 'Unknown'))
+    else:
+        raw = getattr(user, 'username', getattr(user, 'email', 'Unknown'))
+    # html.escape() converts <, >, &, ", ' to safe HTML entities.
+    # Wrapping in Markup tells Jinja2 the value is already escaped so it
+    # does not double-escape the entities.
+    return Markup(html.escape(str(raw) if raw is not None else '', quote=True))
 
 @contextfilter
 def truncate(context, value, length=50):
